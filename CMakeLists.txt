@@ -18,6 +18,18 @@ target_compile_options(vk_flip_meter PRIVATE
     -Wall -Wextra -O2 -fvisibility=hidden
 )
 
+# ── Optional native-CPU build ────────────────────────────────────────────────
+# Opt-in (default OFF) because -march=native ties the resulting .so to the
+# exact CPU it was built on — fine for a personal build on this machine,
+# but breaks portability if you ever distribute the binary.
+#   cmake -DFLM_NATIVE_BUILD=ON ..
+option(FLM_NATIVE_BUILD "Build with -O3 -march=native -flto (not portable across CPUs)" OFF)
+if(FLM_NATIVE_BUILD)
+    target_compile_options(vk_flip_meter PRIVATE -O3 -march=native -flto)
+    target_link_options(vk_flip_meter PRIVATE -flto)
+    message(STATUS "FLM_NATIVE_BUILD enabled: -O3 -march=native -flto")
+endif()
+
 target_link_libraries(vk_flip_meter PRIVATE
     ${CMAKE_THREAD_LIBS_INIT}
 )

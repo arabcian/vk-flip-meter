@@ -1,35 +1,40 @@
 # vk_flip_meter
 
-`vk_flip_meter` is a high-precision Frame Pacing and Cadence Modulation Vulkan Implicit Layer developed for Vulkan-based games and applications on Linux systems. 
+`vk_flip_meter` is a high‑precision Frame Pacing and Cadence Modulation Vulkan Implicit Layer developed for Vulkan‑based games and applications on Linux systems.
 
-Specifically tailored to eliminate micro-stuttering during Motion Frame Generation (MFG) scenarios, it perfectly aligns frame pacing while minimizing CPU and locking overhead[cite: 1].
+It eliminates micro‑stuttering during Motion Frame Generation (MFG) scenarios by precisely aligning frame pacing while minimising CPU overhead.  
+This version is rewritten in **C++20** with robust thread safety, RAII, and full Vulkan object lifecycle management.
 
 ## 🚀 Key Features
 
-* **Precise Hybrid Wait:** Uses the POSIX `clock_nanosleep` API, which wakes up the Linux scheduler much more precisely than standard thread sleeping. When approaching target microsecond thresholds, it switches to architecture-specific processor pausing (`_mm_pause` or thread yield) to achieve nanosecond-level precision.
-* **Zero-Overhead Lockless Loop:** All mutex locks have been completely removed from the critical render loop state (`SwapchainState`). It relies entirely on `std::atomic` variables and cache-line alignment (`alignas(64)`) to ensure thread safety with zero locking overhead.
-* **MFG Cadence Modulation:** Automatically detects modulated or "fake" frames when frame generation multipliers (from 1x up to 4x) are active, dynamically adjusting the render queue to preserve fluid smoothness.
-* **Asynchronous Measurement & Thread Affinity:** Timing measurements run on a dedicated async thread so they do not block the main rendering thread[cite: 1]. This thread is bound to a specific core (typically the second-to-last CPU core via `hardware_concurrency() - 2`) to maintain cache locality.
-* **Real-Time Scheduling:** Supports real-time scheduling capability using the `SCHED_FIFO` protocol, allowing the measurement thread to be prioritized at the operating system level.
-* **Intelligent Hitch Detection & Recovery:** Automatically detects sudden system bottlenecks or large frame drops (`hitch`) and temporarily bypasses pacing mechanisms to prevent latency from building up further.
+- **Precise Hybrid Wait** – Uses `clock_nanosleep` with absolute time for accurate sleeps, then falls back to `sched_yield` and architecture‑specific `_mm_pause` for sub‑millisecond precision.
+- **Zero‑Overhead Lockless Loop** – Critical paths use `std::atomic` and cache‑line alignment (`alignas(64)`); no mutex locks in the render loop.
+- **MFG Cadence Modulation** – Detects “fake” frames when MFG multipliers (1×–4×) are active and dynamically adjusts the queue.
+- **Asynchronous Measurement** – Dedicated `std::jthread` with `std::stop_token` measures presentation times without blocking the main thread.
+- **CPU Affinity & Real‑Time Scheduling** – Binds the measurement thread to a safe core (`cores‑2`) and optionally enables `SCHED_FIFO` via `FLM_RT_PRIORITY` environment variable.
+- **Intelligent Hitch Detection** – Automatically detects large frame drops (hitches) and temporarily disables pacing to prevent latency build‑up.
+- **Full Lifecycle Safety** – Tracks swapchains with `std::shared_ptr`; measurement thread is guaranteed to stop before swapchain destruction.
 
----
+## 🛠️ Requirements
 
-## 🛠️ Requirements and Installation
+- **CMake** ≥ 3.20
+- **Ninja** (recommended) or Make
+- **Vulkan Loader & Headers** (`media-libs/vulkan-loader` and `media-libs/vulkan-layers` on Gentoo)
+- **C++20** compiler (GCC 10+ or Clang 12+)
 
-The project is heavily optimized for performance-oriented distributions like Gentoo Linux, injecting native CPU flags (`-march=native`) and aggressive optimizations (`-O3`, `LTO`).
+## 📦 Building and Installing
 
-### Dependencies
-Before starting the compilation, ensure the following packages are installed on your system:
-* CMake (>= 3.10)
-* Ninja Build System
-* Vulkan Loader & Headers (`media-libs/vulkan-loader` and `media-libs/vulkan-layers` on Gentoo)
-* GCC / Clang (with C++17 support)
-
-### Building and Installing
-
-You can complete the installation by making the `build.sh` script executable and running it from the root directory:
+Run the provided `build.sh` script:
 
 ```bash
 chmod +x build.sh
-./build.sh /usr/local
+./build.sh [INSTALL_PREFIX]
+
+# MFG autodetect (0 = otomatik):
+ENABLE_LAYER_cpu_flip_meter=1 FLM_MFG_MULTIPLIER=0 %command%
+
+# Spin threshold tuning:
+ENABLE_LAYER_cpu_flip_meter=1 FLM_SPIN_THRESHOLD_NS=20000 %command%
+
+# Runtime reload (oyun açıkken):
+kill -SIGUSR1 $(pgrep -f game_executable)

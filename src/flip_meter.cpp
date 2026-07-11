@@ -1,5 +1,5 @@
 // ============================================================================
-// FLM — Vulkan Flip Meter / Frame Pacing Layer  (v2 — "gerçek etki")
+// FLM — Vulkan Flip Meter / Frame Pacing Layer  (v2.1 — "gerçek etki")
 //
 // TASARIM ÖZETİ
 // -------------
@@ -33,6 +33,34 @@
 //   [FIX-13] CreateDevice fallback'inde loader zinciri restore (MangoHud crash).
 //   [FIX-14] pNext'te olan feature'lar tekrar enjekte edilmez.
 //   [FIX-15] Oyunun kendi presentId'leri takip edilir (DXVK uyumu).
+//
+// v2.1 düzeltmeleri (performans / gecikme / akıcılık):
+//   [FIX-16] SLOT ARALIĞI = TÜM aralıkların EMA'sı. m kare toplamda T sürer →
+//            ortalama aralık = T/m; hem paced hem unpaced durumda doğru slot
+//            genişliğini verir. v2 fake-filtreli EMA (≈T) kullanıyordu → MFG'de
+//            pacer FPS'i m kat DÜŞÜRÜYORDU. Kaldırıldı.
+//   [FIX-17] MFG autodetect: eşik artık slot-EMA'ya göre (interval < 0.7*ema).
+//            v2'nin kabul-medyanı tabanlı eşiği matematiksel olarak hiç
+//            tetiklenmiyordu (p≈0 → mhat=1). Kapı aktifken tespit DONDURULUR
+//            (paced uniform aralıklar tespiti zehirler → salınım engeli).
+//   [FIX-18] GPU-bound bekçisi yalnız FLM_TARGET_FPS>0 iken ve ham aralık değil
+//            slot-EMA üzerinden çalışır. v2'de MFG'nin bimodal aralıkları
+//            bekçiyi anında tetikleyip pacing'i kapatıyordu. fps=0 doğal
+//            cadence'ta hedef zaten ölçümden türetildiği için bekçi anlamsız.
+//   [FIX-19] "interval > 2.5*avg → is_fake" dalı kaldırıldı: büyük HITCH'ler
+//            fake sayılıp hitch tespitinden kaçıyordu → hitch sırasında pacing
+//            devam ediyordu (görünür stutter).
+//   [FIX-20] Kapı bekleme tavanı artık aralığa göreli (max(20ms, 1.5*iv)).
+//            Sabit 20ms tavan FPS<=50 hedeflerde limiter'ı tamamen NO-OP
+//            yapıyordu.
+//   [FIX-21] Canlı ayar GERÇEK: FLM_CONFIG=<dosya> (KEY=VALUE) + SIGUSR1.
+//            v2 handler'ı getenv okuyorduk — çalışan sürecin ortamı dışarıdan
+//            değişemez (işlevsiz) ve getenv async-signal-safe değil (UB).
+//            Handler artık yalnız atomik bayrak set eder; reload ölçüm/present
+//            thread'inde yapılır.
+//   [FIX-22] vkAcquireNextImage2KHR intercept edildi (bu yolu kullanan
+//            motorlarda warmup sayacı hiç ilerlemiyordu → kapı hiç açılmıyordu).
+//   [FIX-23] Ölü state temizliği (gate_target_ns / base_flip_ns).
 // ============================================================================
 
 #include <vulkan/vulkan.h>
@@ -100,6 +128,9 @@ namespace FlmConst {
     constexpr int64_t  MAX_PACE_WAIT_NS    = 20'000'000LL;
     constexpr uint32_t STACK_PRESENT_IDS   = 8;
     constexpr int      GPU_BOUND_WINDOW    = 16;   // [item 8]
+    constexpr int      SLOT_WINDOW         = 12;   // [FIX-16] 12 = ekok(1..4) →
+                                                   // her MFG çarpanında tam döngü,
+                                                   // faz kaynaklı ortalama sapması yok
     constexpr int      MFG_DETECT_WINDOW   = 64;   // [item 7]
     constexpr int      MIN_SC_WIDTH        = 640;  // [item 11]
     constexpr int      MIN_SC_HEIGHT       = 480;
@@ -119,6 +150,7 @@ struct FLMConfig {
     std::string measure_cpu;        // [item 13]
     bool        stats        = false;
     std::string csv_path;
+    std::string config_path;        // [FIX-21] FLM_CONFIG canlı ayar dosyası
 
     // Hot-reload edilebilir
     std::atomic<int>     target_fps {0};
@@ -146,25 +178,72 @@ static PacePoint parse_pace_point(const char* s) {
     return PacePoint::PRESENT;
 }
 
-// [item 15] SIGUSR1'de yalnız güvenli alanları yeniden oku.
-static void reload_dynamic_config() {
-    const char* e;
-    if ((e = getenv("FLM_TARGET_FPS")))         g_config.target_fps.store(std::max(0, atoi(e)));
-    if ((e = getenv("FLM_SPIN_NS")))            g_config.spin_ns.store(std::clamp<int64_t>(atoll(e), 0, 2'000'000LL));
-    if ((e = getenv("FLM_PRESENT_LEAD_NS")))    g_config.lead_ns.store(std::clamp<int64_t>(atoll(e), 0, 8'000'000LL));
-    if ((e = getenv("FLM_DRIFT_TOLERANCE_NS"))) g_config.drift_tol.store(std::max<int64_t>(0, atoll(e)));
-    if ((e = getenv("FLM_MODE")))               g_config.mode.store((int)parse_mode(e));
-    if ((e = getenv("FLM_PACE_POINT")))         g_config.pace_point.store((int)parse_pace_point(e));
-    if ((e = getenv("FLM_LOG_LEVEL"))) {
-        std::string l = e;
-        if      (l == "DEBUG") g_log_level.store((int)LogLevel::DEBUG);
-        else if (l == "INFO")  g_log_level.store((int)LogLevel::INFO);
-        else if (l == "WARN")  g_log_level.store((int)LogLevel::WARN);
-        else if (l == "ERROR") g_log_level.store((int)LogLevel::ERR);
+// [FIX-21] Tek KV uygulayıcı — hem env hem config dosyası buradan geçer.
+static void apply_dynamic_kv(const char* key, const char* val) {
+    if (!key || !val || !*val) return;
+    if      (!strcmp(key, "FLM_TARGET_FPS"))         g_config.target_fps.store(std::max(0, atoi(val)));
+    else if (!strcmp(key, "FLM_SPIN_NS"))            g_config.spin_ns.store(std::clamp<int64_t>(atoll(val), 0, 2'000'000LL));
+    else if (!strcmp(key, "FLM_PRESENT_LEAD_NS"))    g_config.lead_ns.store(std::clamp<int64_t>(atoll(val), 0, 8'000'000LL));
+    else if (!strcmp(key, "FLM_DRIFT_TOLERANCE_NS")) g_config.drift_tol.store(std::max<int64_t>(0, atoll(val)));
+    else if (!strcmp(key, "FLM_MODE"))               g_config.mode.store((int)parse_mode(val));
+    else if (!strcmp(key, "FLM_PACE_POINT"))         g_config.pace_point.store((int)parse_pace_point(val));
+    else if (!strcmp(key, "FLM_LOG_LEVEL")) {
+        if      (!strcmp(val, "DEBUG")) g_log_level.store((int)LogLevel::DEBUG);
+        else if (!strcmp(val, "INFO"))  g_log_level.store((int)LogLevel::INFO);
+        else if (!strcmp(val, "WARN"))  g_log_level.store((int)LogLevel::WARN);
+        else if (!strcmp(val, "ERROR")) g_log_level.store((int)LogLevel::ERR);
     }
 }
 
-static void sigusr1_handler(int) { reload_dynamic_config(); }
+// [FIX-21] FLM_CONFIG dosyası: '#' yorum, KEY=VALUE satırları.
+static void load_config_file(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        char* eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char* key = p;
+        char* ke  = eq;
+        while (ke > key && (ke[-1] == ' ' || ke[-1] == '\t')) *--ke = '\0';
+        char* val = eq + 1;
+        size_t n = strlen(val);
+        while (n && (val[n-1] == '\n' || val[n-1] == '\r' ||
+                     val[n-1] == ' '  || val[n-1] == '\t')) val[--n] = '\0';
+        apply_dynamic_kv(key, val);
+    }
+    fclose(f);
+}
+
+// Önce env (statik), sonra dosya (canlı) — dosya kazanır.
+static void reload_dynamic_config() {
+    static const char* keys[] = {
+        "FLM_TARGET_FPS", "FLM_SPIN_NS", "FLM_PRESENT_LEAD_NS",
+        "FLM_DRIFT_TOLERANCE_NS", "FLM_MODE", "FLM_PACE_POINT", "FLM_LOG_LEVEL",
+    };
+    for (const char* k : keys)
+        if (const char* e = getenv(k)) apply_dynamic_kv(k, e);
+    if (!g_config.config_path.empty())
+        load_config_file(g_config.config_path.c_str());
+}
+
+// [FIX-21] Handler async-signal-safe: yalnız bayrak. Reload thread bağlamında.
+static std::atomic<bool> g_reload_flag{false};
+static void sigusr1_handler(int) { g_reload_flag.store(true, std::memory_order_relaxed); }
+
+static inline void maybe_reload() {
+    if (g_reload_flag.load(std::memory_order_relaxed) &&
+        g_reload_flag.exchange(false, std::memory_order_relaxed)) {
+        reload_dynamic_config();
+        FLM_LOG(LogLevel::INFO, "Config reload: mode=%d fps=%d spin=%lld lead=%lld",
+                g_config.mode.load(), g_config.target_fps.load(),
+                (long long)g_config.spin_ns.load(), (long long)g_config.lead_ns.load());
+    }
+}
 
 static void init_config() {
     std::call_once(g_config_flag, []() {
@@ -174,6 +253,7 @@ static void init_config() {
         if ((e = getenv("FLM_MEASURE_CPU")))    g_config.measure_cpu  = e;
         if ((e = getenv("FLM_STATS")))          g_config.stats        = (atoi(e) != 0);
         if ((e = getenv("FLM_CSV")))            g_config.csv_path     = e;
+        if ((e = getenv("FLM_CONFIG")))         g_config.config_path  = e;  // [FIX-21]
         if ((e = getenv("FLM_LOG_FILE"))) { if (FILE* f = fopen(e, "a")) g_log_file = f; }
 
         reload_dynamic_config();
@@ -235,6 +315,7 @@ struct DeviceDispatch {
     PFN_vkDestroyDevice               DestroyDevice               = nullptr;
     PFN_vkQueuePresentKHR             QueuePresentKHR             = nullptr;
     PFN_vkAcquireNextImageKHR         AcquireNextImageKHR         = nullptr;
+    PFN_vkAcquireNextImage2KHR        AcquireNextImage2KHR        = nullptr;  // [FIX-22]
     PFN_vkWaitForPresentKHR           WaitForPresentKHR           = nullptr;
     PFN_vkCreateSwapchainKHR          CreateSwapchainKHR          = nullptr;
     PFN_vkDestroySwapchainKHR         DestroySwapchainKHR         = nullptr;
@@ -261,9 +342,8 @@ struct SwapchainState {
 
     // Hot-path atomikleri — ayrı cache-line (false sharing engeli)
     alignas(64) std::atomic<uint64_t> next_present_id{1};
-    alignas(64) std::atomic<int64_t>  gate_target_ns{0};        // TEK kapı hedefi
-    alignas(64) std::atomic<int64_t>  base_flip_ns{0};          // slot 0 hedefi [item 4]
     alignas(64) std::atomic<int64_t>  slot_interval_ns{FlmConst::DEFAULT_INTERVAL_NS};
+    alignas(64) std::atomic<int64_t>  last_gate_wait_ns{0};     // [FIX-17] tespit dondurma
     alignas(64) std::atomic<uint32_t> present_seq{0};           // [item 4]
     alignas(64) std::atomic<int>      eff_mfg{1};               // [item 7] efektif çarpan
     alignas(64) std::atomic<int>      frame_count{0};
@@ -280,7 +360,14 @@ struct SwapchainState {
     int     di_idx      = 0;
     int     di_count    = 0;
     int     ema_frames  = 0;
-    int64_t filtered_interval_ns = FlmConst::DEFAULT_INTERVAL_NS;
+    int64_t filtered_interval_ns = FlmConst::DEFAULT_INTERVAL_NS; // kabul (gerçek kare) EMA
+    // [FIX-16] Slot penceresi: TÜM aralıkların kayan ortalaması (MFG'nin
+    // bimodal ε/T desenini per-sample EMA'nın aksine tam doğru ortalar).
+    int64_t slot_win[FlmConst::SLOT_WINDOW] = {};
+    int     slot_idx    = 0;
+    int     slot_count  = 0;
+    int64_t slot_sum    = 0;
+    int64_t slot_mean_ns = FlmConst::DEFAULT_INTERVAL_NS;
     int64_t timeline_target_ns   = 0;
     // [item 8] GPU-bound penceresi
     int     over_target_run  = 0;
@@ -441,6 +528,7 @@ static void measurement_thread_fn(std::stop_token stoken, std::shared_ptr<Swapch
     st->stat_last_ns = now_ns();
 
     while (!stoken.stop_requested()) {
+        maybe_reload();   // [FIX-21] SIGUSR1 → burada (AS-safe) uygulanır
         if (!st->disp || !st->disp->has_present_wait) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
@@ -477,31 +565,60 @@ static void measurement_thread_fn(std::stop_token stoken, std::shared_ptr<Swapch
             // Efektif çarpan
             int m = st->eff_mfg.load(std::memory_order_relaxed);
 
-            // Fake-frame sınıflandırma (yalnız FİLTRE için — pacing artık her
-            // present'i uniform aralıklar; fake tespiti EMA'yı korur).
+            // [FIX-16] SLOT ORTALAMASI — TÜM aralıklar üzerinden kayan pencere.
+            // m present toplamda bir gerçek kare süresi (T) alır → ortalama
+            // aralık = T/m; bu, paced (uniform T/m) ve unpaced (ε,...,T-Σε)
+            // durumların İKİSİNDE de doğru slot genişliğidir. Pencere
+            // ortalaması bimodal deseni tam ortalar (EMA'nın aksine faz
+            // sırasından etkilenmez). Hitch zehirlenmesine karşı klemp 4x.
+            {
+                int64_t safe_iv = std::clamp<int64_t>(interval_ns, 100'000LL,
+                                                      st->slot_mean_ns * 4);
+                st->slot_sum += safe_iv - st->slot_win[st->slot_idx];
+                st->slot_win[st->slot_idx] = safe_iv;
+                st->slot_idx = (st->slot_idx + 1) % FlmConst::SLOT_WINDOW;
+                if (st->slot_count < FlmConst::SLOT_WINDOW) st->slot_count++;
+                st->slot_mean_ns = st->slot_sum / st->slot_count;
+            }
+
+            // Fake-frame sınıflandırma (yalnız FİLTRE için — pacing her
+            // present'i uniform aralar; fake tespiti gerçek-kare EMA'sını korur).
+            // [FIX-19] "interval > 2.5*avg → fake" dalı KALDIRILDI: büyük
+            // hitch'ler fake sayılıp hitch tespitinden kaçıyordu.
             bool is_fake = false;
             if (m > 1 && st->di_count > 4) {
                 int64_t split_ns = (avg_before_ns * (m + 1)) / (2LL * m);
-                is_fake = (interval_ns < split_ns) ||
-                          (interval_ns > (avg_before_ns * 5) / 2);
+                is_fake = (interval_ns < split_ns);
             }
 
-            // [item 7] MFG algılama: split-altı oranı
-            {
-                int64_t split_ns = (avg_before_ns * 3) / 4; // ~m=2 eşiği referans
-                if (interval_ns < split_ns) st->mfg_small_cnt++;
-                st->mfg_total_cnt++;
-                if (st->mfg_total_cnt >= FlmConst::MFG_DETECT_WINDOW) {
-                    if (g_config.mfg_mult_env > 0) {
-                        st->eff_mfg.store(g_config.mfg_mult_env, std::memory_order_relaxed);
-                    } else {
+            // [FIX-17] MFG algılama: eşik slot-EMA'ya göre (ema ≈ T/m).
+            //   m=1: interval ≈ ema      → 0.7*ema altına düşmez  → p≈0 → m=1
+            //   m>1: fake ≈ ε << ema, gerçek ≈ m*ema             → p≈(m-1)/m
+            // Kapı yakın zamanda beklettiyse (paced uniform aralıklar tespiti
+            // zehirler) tespit DONDURULUR — m küçülüp slot'un aniden
+            // büyümesinden doğan salınım engellenir.
+            if (g_config.mfg_mult_env > 0) {
+                if (m != g_config.mfg_mult_env)
+                    st->eff_mfg.store(g_config.mfg_mult_env, std::memory_order_relaxed);
+            } else {
+                bool gate_hot = (tnow - st->last_gate_wait_ns.load(std::memory_order_relaxed))
+                                < 1'000'000'000LL;
+                if (gate_hot && m > 1) {
+                    st->mfg_small_cnt = 0;   // donuk pencere: temiz başla
+                    st->mfg_total_cnt = 0;
+                } else {
+                    if (interval_ns * 10 < st->slot_mean_ns * 7) st->mfg_small_cnt++;
+                    st->mfg_total_cnt++;
+                    if (st->mfg_total_cnt >= FlmConst::MFG_DETECT_WINDOW) {
                         double p = (double)st->mfg_small_cnt / (double)st->mfg_total_cnt;
                         int mhat = (p < 0.99) ? (int)std::lround(1.0 / (1.0 - p)) : 4;
                         mhat = std::clamp(mhat, 1, 4);
+                        if (mhat != m)
+                            FLM_LOG(LogLevel::INFO, "MFG carpani: %d -> %d", m, mhat);
                         st->eff_mfg.store(mhat, std::memory_order_relaxed);
+                        st->mfg_small_cnt = 0;
+                        st->mfg_total_cnt = 0;
                     }
-                    st->mfg_small_cnt = 0;
-                    st->mfg_total_cnt = 0;
                 }
             }
 
@@ -532,18 +649,21 @@ static void measurement_thread_fn(std::stop_token stoken, std::shared_ptr<Swapch
                     st->filtered_interval_ns += (safe - st->filtered_interval_ns + 5) / 10;
             }
 
-            // Yayınlanacak slot aralığı: hedef fps varsa ondan, yoksa doğal cadence.
+            // [FIX-16] Yayınlanacak slot aralığı: hedef fps varsa ondan, yoksa
+            // slot-EMA (tüm aralıkların ortalaması ≈ T/m — MFG dahil doğru).
             int fps = g_config.target_fps.load(std::memory_order_relaxed);
             int64_t slot_iv = (fps > 0) ? (1'000'000'000LL / fps)
-                                        : st->filtered_interval_ns;
+                                        : st->slot_mean_ns;
             st->slot_interval_ns.store(slot_iv, std::memory_order_relaxed);
 
-            // [item 8] GPU-bound bekçisi: hedefi tutturamıyorsak pacing'i kapat.
-            if (!is_fake && !is_hitch) {
-                int64_t tgt = slot_iv;
-                if (interval_ns > (tgt * 105) / 100) {
+            // [FIX-18] GPU-bound bekçisi: yalnız AÇIK hedef (fps>0) varken ve
+            // ham aralık değil slot-EMA üzerinden. fps=0 doğal cadence'ta hedef
+            // zaten ölçümden türetilir → bekçi anlamsız (v2'de MFG'nin bimodal
+            // ham aralıkları bekçiyi anında tetikleyip pacing'i kapatıyordu).
+            if (fps > 0) {
+                if (st->slot_mean_ns > (slot_iv * 105) / 100) {
                     st->over_target_run++; st->under_target_run = 0;
-                } else if (interval_ns <= (tgt * 102) / 100) {
+                } else if (st->slot_mean_ns <= (slot_iv * 102) / 100) {
                     st->under_target_run++; st->over_target_run = 0;
                 }
                 if (st->over_target_run >= FlmConst::GPU_BOUND_WINDOW) {
@@ -555,6 +675,10 @@ static void measurement_thread_fn(std::stop_token stoken, std::shared_ptr<Swapch
                         FLM_LOG(LogLevel::DEBUG, "GPU-bound: pacing ON");
                     st->under_target_run = FlmConst::GPU_BOUND_WINDOW;
                 }
+            } else {
+                st->over_target_run = st->under_target_run = 0;
+                if (!st->pacing_enabled.load(std::memory_order_relaxed))
+                    st->pacing_enabled.store(true, std::memory_order_relaxed);
             }
 
             // [item 12] istatistik + CSV
@@ -571,8 +695,8 @@ static void measurement_thread_fn(std::stop_token stoken, std::shared_ptr<Swapch
 
             if (g_config.stats && tnow - st->stat_last_ns >= 5'000'000'000LL &&
                 st->stat_frames > 0) {
-                double avg_ms = (st->stat_sum_ns / (double)st->stat_frames) / 1e6;
-                double max_ms = st->stat_max_ns / 1e6;
+                double avg_ms = ((double)st->stat_sum_ns / (double)st->stat_frames) / 1e6;
+                double max_ms = (double)st->stat_max_ns / 1e6;
                 FLM_LOG(LogLevel::INFO,
                     "STATS %ds: n=%d avg=%.2fms max=%.2fms fake/hitch=%d mfg=%d pacing=%d",
                     5, st->stat_frames, avg_ms, max_ms, st->stat_fake,
@@ -748,7 +872,8 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL FLM_vkCreateDevice(
     d.GetDeviceProcAddr   = (PFN_vkGetDeviceProcAddr)gdpa(*pDevice, "vkGetDeviceProcAddr");
     d.DestroyDevice       = (PFN_vkDestroyDevice)gdpa(*pDevice, "vkDestroyDevice");
     d.QueuePresentKHR     = (PFN_vkQueuePresentKHR)gdpa(*pDevice, "vkQueuePresentKHR");
-    d.AcquireNextImageKHR = (PFN_vkAcquireNextImageKHR)gdpa(*pDevice, "vkAcquireNextImageKHR");
+    d.AcquireNextImageKHR  = (PFN_vkAcquireNextImageKHR)gdpa(*pDevice, "vkAcquireNextImageKHR");
+    d.AcquireNextImage2KHR = (PFN_vkAcquireNextImage2KHR)gdpa(*pDevice, "vkAcquireNextImage2KHR");
     d.WaitForPresentKHR   = (PFN_vkWaitForPresentKHR)gdpa(*pDevice, "vkWaitForPresentKHR");
     d.CreateSwapchainKHR  = (PFN_vkCreateSwapchainKHR)gdpa(*pDevice, "vkCreateSwapchainKHR");
     d.DestroySwapchainKHR = (PFN_vkDestroySwapchainKHR)gdpa(*pDevice, "vkDestroySwapchainKHR");
@@ -942,8 +1067,13 @@ static void apply_gate(SwapchainState* st, bool limiter_mode) {
 
     int64_t target = st->limiter_next_ns - lead;
     int64_t left   = target - t;
-    if (left > 0 && left < FlmConst::MAX_PACE_WAIT_NS)
+    // [FIX-20] Tavan aralığa göreli: sabit 20ms tavan fps<=50 hedeflerde
+    // (iv>=20ms) limiter'ı tamamen no-op yapıyordu.
+    int64_t max_wait = std::max<int64_t>(FlmConst::MAX_PACE_WAIT_NS, iv + iv / 2);
+    if (left > 0 && left < max_wait) {
+        st->last_gate_wait_ns.store(t, std::memory_order_relaxed);  // [FIX-17]
         precise_wait_absolute(target);
+    }
 }
 
 // Etkin modu çöz. limiter_mode çıktısı: gate limiter mantığı mı kullanacak.
@@ -972,20 +1102,16 @@ static bool resolve_gate(const SwapchainState* st, bool has_wait, bool& limiter_
     }
 }
 
-VK_LAYER_EXPORT VkResult VKAPI_CALL FLM_vkAcquireNextImageKHR(
-    VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
-    VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex)
+// [FIX-22] Ortak acquire kapısı — hem AcquireNextImageKHR hem 2KHR yolundan.
+static inline void acquire_gate(VkSwapchainKHR swapchain, bool has_wait)
 {
-    DeviceDispatch* disp = find_device_dispatch(device);
-    if (!disp) return VK_ERROR_DEVICE_LOST;
-
     // [item 6] Yalnız pace_point ACQUIRE/BOTH ise burada kapı uygula.
     PacePoint pp = (PacePoint)g_config.pace_point.load(std::memory_order_relaxed);
     if (pp == PacePoint::ACQUIRE || pp == PacePoint::BOTH) {
         if (auto st = find_sc_state(swapchain)) {   // [FIX-1] shared_ptr kopya
             if (st->frame_count.load(std::memory_order_relaxed) >= FlmConst::WARMUP_FRAMES) {
                 bool limiter_mode = false;
-                if (resolve_gate(st.get(), disp->has_present_wait, limiter_mode))
+                if (resolve_gate(st.get(), has_wait, limiter_mode))
                     apply_gate(st.get(), limiter_mode);
             }
             st->frame_count.fetch_add(1, std::memory_order_relaxed);
@@ -995,13 +1121,37 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL FLM_vkAcquireNextImageKHR(
         if (auto st = find_sc_state(swapchain))
             st->frame_count.fetch_add(1, std::memory_order_relaxed);
     }
+}
 
+VK_LAYER_EXPORT VkResult VKAPI_CALL FLM_vkAcquireNextImageKHR(
+    VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+    VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex)
+{
+    DeviceDispatch* disp = find_device_dispatch(device);
+    if (!disp || !disp->AcquireNextImageKHR) return VK_ERROR_DEVICE_LOST;
+
+    acquire_gate(swapchain, disp->has_present_wait);
     return disp->AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+}
+
+// [FIX-22] Bu yolu kullanan motorlarda warmup sayacı hiç ilerlemiyordu →
+// kapı asla açılmıyordu (limiter+pacer sessizce no-op).
+VK_LAYER_EXPORT VkResult VKAPI_CALL FLM_vkAcquireNextImage2KHR(
+    VkDevice device, const VkAcquireNextImageInfoKHR* pAcquireInfo, uint32_t* pImageIndex)
+{
+    DeviceDispatch* disp = find_device_dispatch(device);
+    if (!disp || !disp->AcquireNextImage2KHR) return VK_ERROR_DEVICE_LOST;
+
+    if (pAcquireInfo)
+        acquire_gate(pAcquireInfo->swapchain, disp->has_present_wait);
+    return disp->AcquireNextImage2KHR(device, pAcquireInfo, pImageIndex);
 }
 
 VK_LAYER_EXPORT VkResult VKAPI_CALL FLM_vkQueuePresentKHR(
     VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 {
+    maybe_reload();   // [FIX-21] ölçüm thread'i yoksa (salt limiter) da çalışsın
+
     QueueData qdata{};
     {
         std::shared_lock qlk(g_queue_lock);
@@ -1099,6 +1249,7 @@ VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL FLM_vkGetDeviceProcAddr(VkDevice d
     INTERCEPT(DestroyDevice);
     INTERCEPT(QueuePresentKHR);
     INTERCEPT(AcquireNextImageKHR);
+    INTERCEPT(AcquireNextImage2KHR);   // [FIX-22]
     INTERCEPT(CreateSwapchainKHR);
     INTERCEPT(DestroySwapchainKHR);
     INTERCEPT(GetDeviceQueue);
@@ -1121,6 +1272,7 @@ VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL FLM_vkGetInstanceProcAddr(VkInstan
     INTERCEPT(DestroyDevice);
     INTERCEPT(QueuePresentKHR);
     INTERCEPT(AcquireNextImageKHR);
+    INTERCEPT(AcquireNextImage2KHR);   // [FIX-22]
     INTERCEPT(CreateSwapchainKHR);
     INTERCEPT(DestroySwapchainKHR);
     INTERCEPT(GetDeviceQueue);
@@ -1174,9 +1326,11 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(
 //  FLM_MEASURE_CPU=0-3         ölçüm thread affinity
 //  FLM_STATS=1                 5 sn'de bir özet log (INFO)
 //  FLM_CSV=/tmp/flm.csv        kare bazlı ölçüm dökümü
+//  FLM_CONFIG=/tmp/flm.conf    canlı ayar dosyası (KEY=VALUE, '#' yorum)
 //  FLM_LOG_LEVEL=DEBUG|INFO|WARN|ERROR
 //  FLM_LOG_FILE=/path          log dosyası (varsayılan stderr)
-//  SIGUSR1                     dinamik alanları (fps/spin/lead/mode/...) reload
+//  SIGUSR1                     FLM_CONFIG dosyasını yeniden oku (env statiktir;
+//                              canlı değişiklik yalnız dosya üzerinden mümkün)
 //
 //  HIZLI DOĞRULAMA:
 //    FLM_MODE=limiter FLM_TARGET_FPS=60 mangohud <oyun>

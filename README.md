@@ -42,19 +42,12 @@ echo 'FLM_TARGET_FPS=90' > /tmp/flm.conf
 kill -SIGUSR1 $(pgrep -f game_executable)
 ```
 
-## v2.1 Değişiklikleri
+## v2.1 changes
 
-- **[FIX-16]** Slot aralığı artık *tüm* present aralıklarının 12'lik kayan pencere
-  ortalaması (≈ T/m). v2'de fake-filtreli EMA (≈ T) kullanılıyordu; MFG aktifken
-  pacer çıkış FPS'ini çarpan kadar düşürüyordu.
-- **[FIX-17]** MFG autodetect çalışır hale getirildi (eşik slot ortalamasına göre,
-  `interval < 0.7·mean`); kapı aktifken tespit dondurularak salınım engellendi.
-- **[FIX-18]** GPU-bound bekçisi yalnız `FLM_TARGET_FPS>0` iken ve slot ortalaması
-  üzerinden çalışır — MFG'nin bimodal aralıkları bekçiyi yanlış tetiklemez.
-- **[FIX-19]** Büyük hitch'lerin `is_fake` sayılıp hitch tespitinden kaçması giderildi.
-- **[FIX-20]** Kapı bekleme tavanı aralığa göreli: `FLM_TARGET_FPS<=50` hedeflerde
-  limiter'ın sessizce devre dışı kalması düzeltildi.
-- **[FIX-21]** Canlı ayar gerçek anlamda çalışıyor: `FLM_CONFIG=<dosya>` (KEY=VALUE)
-  + `SIGUSR1`. Sinyal handler'ı async-signal-safe (yalnız atomik bayrak).
-- **[FIX-22]** `vkAcquireNextImage2KHR` intercept edildi; bu yolu kullanan motorlarda
-  katman artık gerçekten devreye giriyor.
+[FIX-16] Slot interval is now calculated as a 12-frame moving window average of all present intervals ($\approx T/m$). In v2, a fake-filtered EMA ($\approx T$) was used; when MFG was active, it would lower the pacer's output FPS by the multiplication factor.
+[FIX-17] Fixed MFG autodetection (threshold is based on the slot average, interval $<$ $0.7 \cdot \text{mean}$); detection is frozen while the gate is active to prevent oscillations.
+[FIX-18] The GPU-bound watchdog now runs only when FLM_TARGET_FPS $>$ 0 and operates via the slot average — ensuring that MFG's bimodal intervals do not falsely trigger the watchdog.
+[FIX-19] Fixed an issue where large hitches were incorrectly treated as "is_fake" and escaped hitch detection.
+[FIX-20] Gate timeout ceiling is now relative to the interval: fixed a bug where the limiter would silently deactivate at targets where FLM_TARGET_FPS $\le$ 50.
+[FIX-21] On-the-fly configuration is now fully functional: FLM_CONFIG= (KEY=VALUE) SIGUSR1. The signal handler is async-signal-safe (utilizes an atomic flag only).
+[FIX-22] Intercepted vkAcquireNextImage2KHR; the layer now successfully engages in engines utilizing this path.
